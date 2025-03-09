@@ -1,0 +1,5 @@
+.env
+.venv
+pics/
+photo_library/
+library/

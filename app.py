@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 import tempfile
 import atexit
+import psutil
 from utils import (
     create_library_directory, 
     save_uploaded_image, 
@@ -55,6 +56,9 @@ if 'threshold' not in st.session_state:
     st.session_state.threshold = 0.6
 if 'model_name' not in st.session_state:
     st.session_state.model_name = 'VGG-Face'
+if 'max_workers' not in st.session_state:
+    # Default to 2 workers for limited resource systems
+    st.session_state.max_workers = 2
 
 # Set app title
 st.title("Face Identification App")
@@ -77,6 +81,24 @@ with st.sidebar:
         help="Lower threshold values result in more matches but may include false positives."
     )
     
+    # Performance settings
+    st.subheader("Performance Settings")
+    
+    # Get system memory info
+    mem = psutil.virtual_memory()
+    total_gb = mem.total / (1024**3)
+    available_gb = mem.available / (1024**3)
+    
+    st.info(f"System Memory: {total_gb:.1f}GB (Available: {available_gb:.1f}GB)")
+    
+    # Worker count - Set default based on available memory
+    default_workers = min(max(1, int(available_gb)), 4)
+    st.session_state.max_workers = st.slider(
+        "Parallel Workers", 
+        1, 8, default_workers,
+        help="More workers may speed up identification but use more memory. For systems with 2GB RAM or less, keep this at 1-2."
+    )
+    
     st.markdown("---")
     st.markdown("### About")
     st.markdown("""
@@ -85,8 +107,9 @@ with st.sidebar:
     **Features:**
     - Upload images to create a photo library
     - Identify faces using uploaded images or camera
-    - Analyze face attributes (age, gender, emotion, race)
+    - Analyze basic face attributes (age and gender)
     - Sort and filter matches
+    - Parallel processing for improved performance
     """)
 
 # Create tabs for the three main sections
@@ -183,6 +206,10 @@ with tab2:
             debug_container = st.empty()
             debug_container.text("Setting up face recognition...")
             
+            # Log memory usage before processing
+            mem_before = psutil.virtual_memory()
+            debug_container.text(f"Memory usage before: {mem_before.percent}% ({mem_before.available/(1024**3):.1f}GB available)")
+            
             with st.spinner("Analyzing face..."):
                 # Create a progress bar
                 progress_bar = st.progress(0)
@@ -192,35 +219,31 @@ with tab2:
                 debug_container.text(f"Model: {st.session_state.model_name}")
                 debug_container.text(f"Threshold: {st.session_state.threshold}")
                 debug_container.text(f"Library images: {len(library_images)}")
+                debug_container.text(f"Parallel workers: {st.session_state.max_workers}")
                 
-                # Set a more permissive threshold for testing
-                test_threshold = 0.8  # Higher threshold value = more permissive matching
-                
+                # Run matching with the specified number of parallel workers
                 st.session_state.matches = find_matching_faces(
                     st.session_state.target_image_path, 
                     library_images,
-                    threshold=test_threshold,  # Using higher threshold for testing
+                    threshold=st.session_state.threshold,
                     model_name=st.session_state.model_name,
-                    progress_bar=progress_bar
+                    progress_bar=progress_bar,
+                    max_workers=st.session_state.max_workers
                 )
                 
+                # Log memory usage after processing
+                mem_after = psutil.virtual_memory()
+                debug_container.text(f"Memory usage after: {mem_after.percent}% ({mem_after.available/(1024**3):.1f}GB available)")
+                
                 # Log output to the debug container
-                debug_container.text(f"Matching complete. Found {len(st.session_state.matches)} matches with threshold {test_threshold}")
+                debug_container.text(f"Matching complete. Found {len(st.session_state.matches)} matches")
                 
                 # Clear the progress bar
                 progress_bar.empty()
                 
                 if st.session_state.matches:
                     st.success(f"Found {len(st.session_state.matches)} matching faces!")
-                    
-                    # Show some debug info about the first match
-                    if len(st.session_state.matches) > 0:
-                        match = st.session_state.matches[0]
-                        debug_container.text(f"Best match: {os.path.basename(match['image_path'])}")
-                        debug_container.text(f"Distance: {match['distance']}")
-                        debug_container.text(f"Verified: {match['verified']}")
-                    
-                        st.rerun()
+                    st.rerun()
                 else:
                     st.warning("No matching faces found in the library.")
                     
@@ -247,14 +270,32 @@ with tab3:
         # Simple sorting options
         sort_by = st.selectbox(
             "Sort results by:", 
-            ["Best Match (Highest %)", "Worst Match (Lowest %)"]
+            ["Best Match (Highest %)", "Worst Match (Lowest %)", "Age", "Gender"]
         )
         
-        # Sort the matches (lower distance = better match = higher percentage)
+        # Sort the matches based on selected criteria
         if sort_by == "Best Match (Highest %)":
             sorted_matches = sorted(matches, key=lambda x: x['distance'])  # Lower distance = better match
-        else:
+        elif sort_by == "Worst Match (Lowest %)":
             sorted_matches = sorted(matches, key=lambda x: x['distance'], reverse=True)
+        elif sort_by == "Age":
+            # Sort by age (youngest to oldest)
+            sorted_matches = sorted(matches, key=lambda x: x['analysis'][0]['age'] if x.get('analysis') and len(x.get('analysis', [])) > 0 and 'age' in x['analysis'][0] else 999)
+        elif sort_by == "Gender":
+            # Sort by gender (Female then Male)
+            def get_gender(match):
+                if not match.get('analysis') or len(match.get('analysis', [])) == 0 or 'gender' not in match['analysis'][0]:
+                    return ""
+                gender_data = match['analysis'][0]['gender']
+                if isinstance(gender_data, dict):
+                    return "Female" if gender_data.get('Woman', 0) > gender_data.get('Man', 0) else "Male"
+                elif isinstance(gender_data, str):
+                    if gender_data.lower() in ["woman", "female"]:
+                        return "Female"
+                    else:
+                        return "Male"
+                return str(gender_data)
+            sorted_matches = sorted(matches, key=get_gender)
         
         # Display matches in a grid layout
         cols_per_row = 3

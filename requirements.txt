@@ -3,4 +3,5 @@ tf-keras
 deepface
 pillow
 numpy
-opencv-python
+opencv-python-headless
+psutil

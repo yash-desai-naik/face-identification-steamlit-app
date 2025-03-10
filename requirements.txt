@@ -1,4 +1,5 @@
 streamlit
+tensorflow-cpu
 tf-keras
 deepface
 pillow

@@ -1,3 +1,6 @@
+# Import force_cpu first to set environment variables before TensorFlow loads
+import force_cpu
+
 import streamlit as st
 
 # Set page config - this must be the first Streamlit command

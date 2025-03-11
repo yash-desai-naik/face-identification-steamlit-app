@@ -9,6 +9,7 @@ import gc
 import cv2
 import json
 import tempfile
+from pathlib import Path
 
 # Check if deepface is available without using Streamlit
 deepface_available = importlib.util.find_spec("deepface") is not None
@@ -16,6 +17,12 @@ deepface_available = importlib.util.find_spec("deepface") is not None
 # Only import if available
 if deepface_available:
     from deepface import DeepFace
+    # Try to import face embeddings functionality
+    try:
+        from deepface.commons import functions as deepface_functions
+        embeddings_available = True
+    except:
+        embeddings_available = False
 else:
     # Create a dummy DeepFace class for minimal functionality
     class DummyDeepFace:
@@ -32,16 +39,21 @@ else:
             return []
     
     DeepFace = DummyDeepFace
+    embeddings_available = False
 
 def create_library_directory(library_path='library'):
     """Create the library directory if it doesn't exist."""
     if not os.path.exists(library_path):
         os.makedirs(library_path)
     
-    # Also create a directory to store face metadata
+    # Also create directories to store face metadata and embeddings
     metadata_path = os.path.join(library_path, 'metadata')
     if not os.path.exists(metadata_path):
         os.makedirs(metadata_path)
+        
+    embeddings_path = os.path.join(library_path, 'embeddings')
+    if not os.path.exists(embeddings_path):
+        os.makedirs(embeddings_path)
         
     return library_path
 
@@ -59,44 +71,155 @@ def save_uploaded_image(uploaded_image, library_path='library', filename=None):
     
     return filepath
 
+def extract_faces_with_mtcnn(img_path):
+    """Use MTCNN for more accurate face detection on Apple Silicon."""
+    try:
+        from mtcnn import MTCNN
+        import cv2
+        
+        # Load image
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Failed to load image: {img_path}")
+            return []
+            
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Initialize MTCNN with lower confidence threshold
+        detector = MTCNN(min_face_size=20)
+        
+        # Detect faces
+        faces = detector.detect_faces(img_rgb)
+        
+        # Convert to DeepFace-like format
+        result = []
+        for face in faces:
+            # Lower confidence threshold to 0.7 to catch more faces
+            if face.get('confidence', 0) < 0.7:
+                continue
+                
+            box = face['box']
+            result.append({
+                'facial_area': {
+                    'x': box[0],
+                    'y': box[1],
+                    'w': box[2],
+                    'h': box[3]
+                },
+                'confidence': face.get('confidence', 0.9)
+            })
+        
+        # If MTCNN fails to detect faces, try cascade classifier as fallback
+        if not result:
+            # Try OpenCV's cascade classifier as fallback
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
+            
+            for (x, y, w, h) in faces:
+                result.append({
+                    'facial_area': {
+                        'x': x,
+                        'y': y,
+                        'w': w,
+                        'h': h
+                    },
+                    'confidence': 0.8  # Default confidence for cascade detector
+                })
+        
+        return result
+    except Exception as e:
+        print(f"MTCNN face detection failed: {e}")
+        return []
+
 def extract_and_save_faces_metadata(image_path, library_path='library'):
     """Extract faces from an image and save metadata."""
-    if not deepface_available or not os.path.exists(image_path):
+    if not os.path.exists(image_path):
         return []
     
     try:
+        # Create metadata directory if it doesn't exist
+        metadata_dir = os.path.join(library_path, 'metadata')
+        if not os.path.exists(metadata_dir):
+            os.makedirs(metadata_dir)
+        
+        # Create embeddings directory if it doesn't exist
+        embeddings_dir = os.path.join(library_path, 'embeddings')
+        if not os.path.exists(embeddings_dir):
+            os.makedirs(embeddings_dir)
+        
         # Create a unique metadata filename based on the image name
         image_filename = os.path.basename(image_path)
         metadata_filename = f"{os.path.splitext(image_filename)[0]}_faces.json"
-        metadata_path = os.path.join(library_path, 'metadata', metadata_filename)
+        metadata_path = os.path.join(metadata_dir, metadata_filename)
         
-        # Extract faces from the image
-        faces = DeepFace.extract_faces(
-            img_path=image_path,
-            enforce_detection=False,  # Don't fail if face detection isn't clear
-            align=True,
-            detector_backend='opencv'
-        )
+        faces = []
+        
+        # Step 1: Try MTCNN for better accuracy (includes fallback to cascade)
+        faces = extract_faces_with_mtcnn(image_path)
+        
+        # Step 2: If MTCNN fails, try DeepFace if available
+        if not faces and deepface_available:
+            try:
+                detector_backends = ['opencv', 'ssd', 'mtcnn', 'retinaface']
+                
+                # Try different detector backends until one works
+                for detector in detector_backends:
+                    try:
+                        extracted_faces = DeepFace.extract_faces(
+                            img_path=image_path,
+                            enforce_detection=False,
+                            align=True,
+                            detector_backend=detector
+                        )
+                        
+                        if extracted_faces:
+                            faces = extracted_faces
+                            print(f"Found faces using {detector} backend")
+                            break
+                    except Exception as e:
+                        print(f"Failed with {detector} backend: {e}")
+                        continue
+            except Exception as e:
+                print(f"DeepFace extraction failed: {e}")
+        
+        # Step 3: Manual face detection as last resort - full image
+        if not faces:
+            print("All face detection methods failed, using whole image as face")
+            # Get image dimensions and use the entire image as a face
+            img = cv2.imread(image_path)
+            if img is not None:
+                h, w = img.shape[:2]
+                # Create a "face" covering most of the image
+                faces = [{
+                    'facial_area': {
+                        'x': int(w * 0.1),  # 10% margin
+                        'y': int(h * 0.1),  # 10% margin
+                        'w': int(w * 0.8),  # 80% of width
+                        'h': int(h * 0.8)   # 80% of height
+                    },
+                    'confidence': 0.5  # Low confidence for this fallback method
+                }]
         
         # Check if this is a group photo (has multiple faces)
         is_group_photo = len(faces) > 1
         
-        # Save temporary face images for group photos
+        # Save face images with larger margins
         face_files = []
-        if is_group_photo:
+        if faces:  # Process all images with detected faces
             # Load the original image
             img = cv2.imread(image_path)
             if img is None:
                 return []
                 
-            # Save each face as a temporary file
+            # Save each face as a file
             for i, face_data in enumerate(faces):
                 face_region = face_data['facial_area']
                 x, y, w, h = face_region['x'], face_region['y'], face_region['w'], face_region['h']
                 
-                # Add a margin around the face (20%)
-                margin_x = int(w * 0.2)
-                margin_y = int(h * 0.2)
+                # Add a larger margin around the face (50% for better recognition)
+                margin_x = int(w * 0.5)
+                margin_y = int(h * 0.5)
                 
                 # Ensure coordinates are within image bounds
                 x_start = max(0, x - margin_x)
@@ -111,15 +234,44 @@ def extract_and_save_faces_metadata(image_path, library_path='library'):
                 if face_img.size == 0:
                     continue
                     
-                # Save the face to a temporary file in the metadata directory
+                # Save the face to a file in the metadata directory
                 face_filename = f"{os.path.splitext(image_filename)[0]}_face_{i}.jpg"
-                face_path = os.path.join(library_path, 'metadata', face_filename)
+                face_path = os.path.join(metadata_dir, face_filename)
                 cv2.imwrite(face_path, face_img)
+                
+                # Generate and save face embedding if available
+                embedding_path = None
+                if embeddings_available and deepface_available:
+                    try:
+                        # Compute embedding for the face image
+                        models = ["VGG-Face", "Facenet", "Facenet512", "ArcFace"]
+                        embeddings = {}
+                        
+                        for model_name in models:
+                            try:
+                                embedding = DeepFace.represent(
+                                    img_path=face_path,
+                                    model_name=model_name,
+                                    enforce_detection=False
+                                )
+                                embeddings[model_name] = embedding
+                            except:
+                                pass
+                        
+                        if embeddings:
+                            # Save embeddings to file
+                            embedding_filename = f"{os.path.splitext(image_filename)[0]}_face_{i}_embedding.json"
+                            embedding_path = os.path.join(embeddings_dir, embedding_filename)
+                            with open(embedding_path, 'w') as f:
+                                json.dump(embeddings, f)
+                    except Exception as e:
+                        print(f"Failed to generate face embedding: {e}")
                 
                 # Add file info to the list
                 face_files.append({
                     'filename': face_filename,
                     'path': face_path,
+                    'embedding_path': embedding_path,
                     'facial_area': face_region
                 })
         
@@ -132,7 +284,7 @@ def extract_and_save_faces_metadata(image_path, library_path='library'):
             'faces': [
                 {
                     'facial_area': face['facial_area'],
-                    'confidence': face['confidence'] if 'confidence' in face else None
+                    'confidence': face.get('confidence', 0.5)
                 } for face in faces
             ]
         }
@@ -191,6 +343,7 @@ def delete_image(filepath):
         base_name = os.path.splitext(image_filename)[0]
         library_path = os.path.dirname(filepath)
         metadata_dir = os.path.join(library_path, 'metadata')
+        embeddings_dir = os.path.join(library_path, 'embeddings')
         
         # Delete metadata file
         metadata_filename = f"{base_name}_faces.json"
@@ -203,31 +356,85 @@ def delete_image(filepath):
             if f.startswith(f"{base_name}_face_") and os.path.isfile(os.path.join(metadata_dir, f)):
                 os.remove(os.path.join(metadata_dir, f))
                 
+        # Delete embedding files
+        if os.path.exists(embeddings_dir):
+            for f in os.listdir(embeddings_dir):
+                if f.startswith(f"{base_name}_face_") and os.path.isfile(os.path.join(embeddings_dir, f)):
+                    os.remove(os.path.join(embeddings_dir, f))
+                
         return True
     return False
 
-def analyze_face(image_path):
-    """Analyze a face using DeepFace."""
+def evaluate_face_match(result, target_path, face_path):
+    """Additional verification for face matches to reduce false positives."""
     try:
-        # Check if DeepFace is available
-        if not deepface_available:
-            return None
+        # Primary verification from DeepFace.verify result
+        distance = result['distance']
+        verified = result['verified']
         
-        # Make sure the image path exists
-        if not os.path.isfile(image_path):
-            print(f"Image not found for analysis: {image_path}")
-            return None
+        # Attempt secondary verification using alternative models
+        if deepface_available:
+            # Try a different model for verification
+            alternative_models = ["Facenet512", "ArcFace", "Facenet"]
+            current_model = result.get('model', "VGG-Face")
             
-        # Analyze the face for age and gender only
-        analysis = DeepFace.analyze(
-            img_path=image_path, 
-            actions=['age', 'gender'],
-            enforce_detection=False  # Important: Don't fail if face isn't clearly detected
-        )
-        return analysis
+            # Find a model we didn't use yet
+            verification_model = next((m for m in alternative_models if m != current_model), None)
+            
+            if verification_model:
+                try:
+                    second_verification = DeepFace.verify(
+                        img1_path=target_path,
+                        img2_path=face_path,
+                        model_name=verification_model,
+                        enforce_detection=False
+                    )
+                    
+                    # Require at least one alternative model to agree
+                    if not second_verification['verified'] and verified:
+                        print(f"Secondary verification failed using {verification_model}")
+                        # Increase distance to reduce match confidence
+                        distance = (distance + 1.0) / 2  # Average with 1.0 (maximum distance)
+                        verified = False
+                except:
+                    # If secondary verification fails, be more conservative
+                    if distance > 0.3:  # If it's not a very strong match already
+                        distance += 0.1  # Penalize the confidence
+                
+            # Check face size ratio for additional verification
+            try:
+                img1 = cv2.imread(target_path)
+                img2 = cv2.imread(face_path)
+                
+                if img1 is not None and img2 is not None:
+                    # Get face sizes
+                    h1, w1 = img1.shape[:2]
+                    h2, w2 = img2.shape[:2]
+                    
+                    # Compare face aspect ratios - they should be similar for the same person
+                    ratio1 = w1 / h1
+                    ratio2 = w2 / h2
+                    
+                    ratio_diff = abs(ratio1 - ratio2)
+                    if ratio_diff > 0.5:  # If aspect ratios are very different
+                        print(f"Face aspect ratio differs significantly: {ratio_diff}")
+                        distance += 0.15  # Penalize the match
+                        if distance >= 0.8:
+                            verified = False
+            except Exception as e:
+                print(f"Face size verification error: {e}")
+        
+        # Update the result with our new verification
+        return {
+            'distance': distance,
+            'verified': verified,
+            'adjusted': True  # Flag that we've applied additional verification
+        }
+        
     except Exception as e:
-        print(f"Error analyzing face: {e}")
-        return None
+        print(f"Error in evaluate_face_match: {e}")
+        # Return original result if evaluation fails
+        return result
 
 def process_single_comparison(args):
     """Process a single face comparison - function for parallel processing."""
@@ -265,31 +472,29 @@ def process_single_comparison(args):
             print(f"Image verification failed: {e}")
             return None
             
-        # Compare faces using DeepFace
+        # Compare faces using DeepFace with optimized settings for performance
         result = DeepFace.verify(
             img1_path=target_image_path, 
             img2_path=face_path, 
             model_name=model_name,
-            enforce_detection=False
+            detector_backend='opencv',  # Fastest detector
+            enforce_detection=False,    # Don't fail on detection errors
+            align=True                 # Align faces for better accuracy
         )
+        
+        # Apply additional verification to reduce false positives
+        result = evaluate_face_match(result, target_image_path, face_path)
         
         # Check if match passes threshold
         passed_threshold = result['verified'] or result['distance'] < threshold
         
         if passed_threshold:
-            # Try to get analysis but don't fail if it doesn't work
-            try:
-                analysis = analyze_face(face_path)
-            except Exception:
-                analysis = None
-                
             return {
                 'image_path': library_image,  # Original image path
                 'face_path': face_path,       # Path to the face image
                 'distance': result['distance'],
                 'verified': result['verified'],
                 'passed_threshold': passed_threshold,
-                'analysis': analysis,
                 'is_face_extract': is_face_extract,
                 'facial_area': facial_area
             }
@@ -301,7 +506,6 @@ def process_single_comparison(args):
                 'distance': result['distance'],
                 'verified': result['verified'],
                 'passed_threshold': False,
-                'analysis': None,
                 'is_face_extract': is_face_extract,
                 'facial_area': facial_area
             }
@@ -327,19 +531,20 @@ def find_matching_faces(target_image_path, library_images, threshold=0.6, model_
         
         # Process each library image
         for img_path in library_images:
-            # Add the full image to comparison items
-            comparison_items.append(img_path)
-            
             # Check if this is a group photo and extract individual faces
             metadata = get_face_metadata(img_path, library_path)
             
-            if metadata and metadata.get('is_group_photo', False) and metadata.get('face_files'):
+            if metadata and metadata.get('face_files'):
+                # Add individual faces from the image
                 for face_file in metadata['face_files']:
                     comparison_items.append({
                         'original_image': img_path,
                         'face_path': face_file['path'],
                         'facial_area': face_file['facial_area']
                     })
+            else:
+                # Add the full image if no faces were extracted
+                comparison_items.append(img_path)
         
         # Prepare arguments for parallel processing
         args_list = [(target_image_path, item, threshold, model_name) for item in comparison_items]
@@ -371,7 +576,8 @@ def find_matching_faces(target_image_path, library_images, threshold=0.6, model_
                         # Only keep full details for matches
                         if result['passed_threshold']:
                             matches.append(result)
-                        # Basic info for debugging/tracking
+                            
+                        # Basic info for debugging
                         if isinstance(item, dict):
                             item_name = os.path.basename(item['face_path'])
                         else:
@@ -401,27 +607,3 @@ def find_matching_faces(target_image_path, library_images, threshold=0.6, model_
     # Sort matches by distance (best matches first)
     matches.sort(key=lambda x: x['distance'])
     return matches
-
-def sort_matches(matches, sort_by='distance'):
-    """Sort matches based on the specified criteria."""
-    if not matches:
-        return []
-        
-    if sort_by == 'distance':
-        return sorted(matches, key=lambda x: x['distance'])
-    elif sort_by == 'gender':
-        # Sort by gender
-        def get_gender(match):
-            if match['analysis'] is None:
-                return ''
-            return match['analysis'][0]['gender']
-        return sorted(matches, key=get_gender)
-    elif sort_by == 'age':
-        # Sort by age
-        def get_age(match):
-            if match['analysis'] is None:
-                return 0
-            return match['analysis'][0]['age']
-        return sorted(matches, key=get_age)
-    else:
-        return matches

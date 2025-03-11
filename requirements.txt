@@ -5,4 +5,7 @@ deepface
 pillow
 numpy
 opencv-python-headless
+mtcnn
 psutil
+scikit-image
+dlib-bin

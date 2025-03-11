@@ -1,0 +1,7 @@
+[theme]
+base="dark"
+primaryColor="#3b82f6"  # A refined soft blue (not neon)
+backgroundColor="#1c1c1e"  # Apple-style dark background
+secondaryBackgroundColor="#2c2c2e"
+textColor="#e5e5e7"  # Softer gray-white
+font="monospace"

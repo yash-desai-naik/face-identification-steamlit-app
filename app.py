@@ -18,15 +18,16 @@ from PIL import Image
 import tempfile
 import atexit
 import psutil
+import cv2
 from utils import (
     create_library_directory, 
     save_uploaded_image, 
     get_library_images, 
     delete_image, 
-    analyze_face, 
     find_matching_faces, 
-    sort_matches,
-    deepface_available
+    deepface_available,
+    get_face_metadata,
+    extract_and_save_faces_metadata
 )
 
 # Check if DeepFace is installed
@@ -56,12 +57,14 @@ if 'target_image_path' not in st.session_state:
 if 'matches' not in st.session_state:
     st.session_state.matches = []
 if 'threshold' not in st.session_state:
-    st.session_state.threshold = 0.6
+    st.session_state.threshold = 0.5  # Stricter default threshold
 if 'model_name' not in st.session_state:
-    st.session_state.model_name = 'VGG-Face'
+    st.session_state.model_name = 'Facenet512'  # Better default model
 if 'max_workers' not in st.session_state:
-    # Default to 2 workers for limited resource systems
-    st.session_state.max_workers = 2
+    # Default to 4 workers for better performance on M-series chips
+    st.session_state.max_workers = 4
+if 'strict_mode' not in st.session_state:
+    st.session_state.strict_mode = True  # Enable strict mode by default
 
 # Set app title
 st.title("Face Identification App")
@@ -71,17 +74,25 @@ with st.sidebar:
     st.title("Settings")
     
     # Model selection
+    model_options = ["Facenet512", "ArcFace", "Facenet", "VGG-Face", "OpenFace", "DeepFace"]
     st.session_state.model_name = st.selectbox(
         "Face Recognition Model",
-        ["VGG-Face", "Facenet", "OpenFace", "DeepFace", "DeepID", "ArcFace", "Dlib"],
-        index=0
+        model_options,
+        index=model_options.index("Facenet512") if "Facenet512" in model_options else 0
     )
     
     # Threshold adjustment
     st.session_state.threshold = st.slider(
         "Matching Threshold", 
-        0.0, 1.0, 0.6, 0.01,
+        0.0, 1.0, 0.5, 0.01,  # Stricter default threshold
         help="Lower threshold values result in more matches but may include false positives."
+    )
+    
+    # Strict mode option
+    st.session_state.strict_mode = st.checkbox(
+        "Strict Matching", 
+        value=True,
+        help="Enable additional verification to reduce false positives"
     )
     
     # Performance settings
@@ -95,24 +106,24 @@ with st.sidebar:
     st.info(f"System Memory: {total_gb:.1f}GB (Available: {available_gb:.1f}GB)")
     
     # Worker count - Set default based on available memory
-    default_workers = min(max(1, int(available_gb)), 4)
+    default_workers = min(max(2, int(available_gb / 2)), 8)  # More aggressive parallelism for Apple Silicon
     st.session_state.max_workers = st.slider(
         "Parallel Workers", 
-        1, 8, default_workers,
-        help="More workers may speed up identification but use more memory. For systems with 2GB RAM or less, keep this at 1-2."
+        2, 16, default_workers,
+        help="More workers may speed up identification on powerful machines like Apple Silicon."
     )
     
     st.markdown("---")
     st.markdown("### About")
     st.markdown("""
-    This app uses DeepFace for face recognition and analysis.
+    This app uses DeepFace for face recognition with improved accuracy.
     
     **Features:**
     - Upload images to create a photo library
     - Identify faces using uploaded images or camera
-    - Analyze basic face attributes (age and gender)
-    - Sort and filter matches
-    - Parallel processing for improved performance
+    - Detect and match faces in group photos
+    - Advanced matching validation to reduce false positives
+    - Optimized for Apple Silicon
     """)
 
 # Create tabs for the three main sections
@@ -154,13 +165,36 @@ with tab1:
                     with cols[col_idx]:
                         img_path = library_images[img_idx]
                         img = Image.open(img_path)
-                        st.image(img, caption=os.path.basename(img_path), width=150)
+                        
+                        # Get face metadata
+                        metadata = get_face_metadata(img_path, LIBRARY_PATH)
+                        face_count = metadata.get('face_count', 0) if metadata else 0
+                        
+                        # Show badge for group photos
+                        if face_count > 1:
+                            st.image(img, caption=f"{os.path.basename(img_path)} ({face_count} faces)", width=150)
+                        else:
+                            st.image(img, caption=os.path.basename(img_path), width=150)
                         
                         # Add delete button for each image
                         if st.button(f"Delete", key=f"delete_{img_idx}"):
                             if delete_image(img_path):
                                 st.success(f"Deleted {os.path.basename(img_path)}")
                                 st.rerun()
+                                
+                        # Add analyze button for each image
+                        if st.button(f"Extract Faces", key=f"analyze_{img_idx}"):
+                            with st.spinner(f"Extracting faces from {os.path.basename(img_path)}..."):
+                                metadata = extract_and_save_faces_metadata(img_path, LIBRARY_PATH)
+                                if metadata:
+                                    st.write(f"Found {metadata['face_count']} face(s)")
+                                    # If it's a group photo, show extracted faces
+                                    if metadata.get('face_files'):
+                                        face_cols = st.columns(min(4, len(metadata['face_files'])))
+                                        for i, face_file in enumerate(metadata['face_files']):
+                                            with face_cols[i % 4]:
+                                                face_img = Image.open(face_file['path'])
+                                                st.image(face_img, caption=f"Face {i+1}", width=100)
     else:
         st.info("No images in the library. Please upload some images.")
 
@@ -209,11 +243,23 @@ with tab2:
             debug_container = st.empty()
             debug_container.text("Setting up face recognition...")
             
-            # Log memory usage before processing
-            mem_before = psutil.virtual_memory()
-            debug_container.text(f"Memory usage before: {mem_before.percent}% ({mem_before.available/(1024**3):.1f}GB available)")
+            # Extract face from target image first
+            with st.spinner("Analyzing target face..."):
+                # Create a temporary directory for target face extraction
+                temp_dir = tempfile.mkdtemp()
+                try:
+                    # Extract faces with multiple detection methods
+                    target_metadata = extract_and_save_faces_metadata(st.session_state.target_image_path, temp_dir)
+                    
+                    # If no face found in target even with our robust methods, use the whole image
+                    if not target_metadata or target_metadata['face_count'] == 0:
+                        st.warning("Face detection is having trouble with this image. Proceeding with the whole image...")
+                        # No need to stop, we'll use the whole image as is
+                except Exception as e:
+                    st.error(f"Error during face analysis: {e}")
+                    # Continue with the original image even if face detection fails
             
-            with st.spinner("Analyzing face..."):
+            with st.spinner("Searching for matches..."):
                 # Create a progress bar
                 progress_bar = st.progress(0)
                 
@@ -223,6 +269,7 @@ with tab2:
                 debug_container.text(f"Threshold: {st.session_state.threshold}")
                 debug_container.text(f"Library images: {len(library_images)}")
                 debug_container.text(f"Parallel workers: {st.session_state.max_workers}")
+                debug_container.text(f"Strict mode: {'Enabled' if st.session_state.strict_mode else 'Disabled'}")
                 
                 # Run matching with the specified number of parallel workers
                 st.session_state.matches = find_matching_faces(
@@ -231,15 +278,9 @@ with tab2:
                     threshold=st.session_state.threshold,
                     model_name=st.session_state.model_name,
                     progress_bar=progress_bar,
-                    max_workers=st.session_state.max_workers
+                    max_workers=st.session_state.max_workers,
+                    library_path=LIBRARY_PATH
                 )
-                
-                # Log memory usage after processing
-                mem_after = psutil.virtual_memory()
-                debug_container.text(f"Memory usage after: {mem_after.percent}% ({mem_after.available/(1024**3):.1f}GB available)")
-                
-                # Log output to the debug container
-                debug_container.text(f"Matching complete. Found {len(st.session_state.matches)} matches")
                 
                 # Clear the progress bar
                 progress_bar.empty()
@@ -254,8 +295,9 @@ with tab2:
                     debug_container.markdown("### Debugging Information")
                     debug_container.text("No matches found. This could be due to:")
                     debug_container.text("1. Face detection issues in the images")
-                    debug_container.text("2. The threshold might be too strict")
-                    debug_container.text("3. Model compatibility issues")
+                    debug_container.text("2. The threshold might be too strict (try lowering it)")
+                    debug_container.text("3. Try a different model like ArcFace")
+                    debug_container.text("4. Try disabling Strict Matching mode")
                     debug_container.text("\nTry uploading clearer images with faces clearly visible.")
         else:
             st.warning("No images in the library. Please upload some images to the library first.")
@@ -268,37 +310,33 @@ with tab3:
     if 'matches' in st.session_state and st.session_state.matches:
         matches = st.session_state.matches
         
-        st.success(f"Found {len(matches)} matching faces!")
+        # Categorize matches into direct and group photo matches
+        direct_matches = [m for m in matches if not m.get('is_face_extract', False)]
+        group_matches = [m for m in matches if m.get('is_face_extract', False)]
         
-        # Simple sorting options
-        sort_by = st.selectbox(
-            "Sort results by:", 
-            ["Best Match (Highest %)", "Worst Match (Lowest %)", "Age", "Gender"]
+        st.success(f"Found {len(matches)} matching faces! ({len(direct_matches)} direct matches, {len(group_matches)} from group photos)")
+        
+        # Allow filtering matches further with a confidence slider
+        min_confidence = st.slider(
+            "Minimum match confidence (%)", 
+            0, 100, 60,  # Default to higher confidence minimum
+            help="Only show matches with confidence above this threshold"
         )
         
-        # Sort the matches based on selected criteria
-        if sort_by == "Best Match (Highest %)":
-            sorted_matches = sorted(matches, key=lambda x: x['distance'])  # Lower distance = better match
-        elif sort_by == "Worst Match (Lowest %)":
-            sorted_matches = sorted(matches, key=lambda x: x['distance'], reverse=True)
-        elif sort_by == "Age":
-            # Sort by age (youngest to oldest)
-            sorted_matches = sorted(matches, key=lambda x: x['analysis'][0]['age'] if x.get('analysis') and len(x.get('analysis', [])) > 0 and 'age' in x['analysis'][0] else 999)
-        elif sort_by == "Gender":
-            # Sort by gender (Female then Male)
-            def get_gender(match):
-                if not match.get('analysis') or len(match.get('analysis', [])) == 0 or 'gender' not in match['analysis'][0]:
-                    return ""
-                gender_data = match['analysis'][0]['gender']
-                if isinstance(gender_data, dict):
-                    return "Female" if gender_data.get('Woman', 0) > gender_data.get('Man', 0) else "Male"
-                elif isinstance(gender_data, str):
-                    if gender_data.lower() in ["woman", "female"]:
-                        return "Female"
-                    else:
-                        return "Male"
-                return str(gender_data)
-            sorted_matches = sorted(matches, key=get_gender)
+        # Filter matches based on confidence
+        filtered_matches = [
+            m for m in matches 
+            if max(0, min(100, (1 - m['distance']) * 100)) >= min_confidence
+        ]
+        
+        if not filtered_matches:
+            st.info(f"No matches meet the minimum confidence threshold of {min_confidence}%. Try lowering the threshold.")
+            st.stop()
+            
+        st.write(f"Showing {len(filtered_matches)} matches above {min_confidence}% confidence")
+        
+        # Sort the matches by match quality (lowest distance = best match)
+        sorted_matches = sorted(filtered_matches, key=lambda x: x['distance'])
         
         # Display matches in a grid layout
         cols_per_row = 3
@@ -315,8 +353,33 @@ with tab3:
                     
                     with cols[col_idx]:
                         try:
-                            img = Image.open(match['image_path'])
-                            st.image(img, caption=os.path.basename(match['image_path']), width=200)
+                            # Show original image with highlight if it's from a group photo
+                            original_img_path = match['image_path']
+                            display_img = Image.open(original_img_path)
+                            
+                            # If this is a face from a group photo, highlight the face
+                            if match.get('is_face_extract', False) and match.get('facial_area'):
+                                # Draw rectangle around matched face in original image
+                                img_cv = cv2.imread(original_img_path)
+                                facial_area = match['facial_area']
+                                x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
+                                
+                                # Draw a more visible rectangle (thicker, bright green)
+                                cv2.rectangle(img_cv, (x, y), (x + w, y + h), (0, 255, 0), 5)
+                                
+                                # Convert back to PIL for display
+                                display_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+                                
+                                # Show the caption with group photo designation
+                                st.image(display_img, caption=f"Group photo: {os.path.basename(original_img_path)}", width=200)
+                                
+                                # Also display the extracted face
+                                face_img = Image.open(match['face_path'])
+                                st.image(face_img, caption="Matched Face", width=120)
+                            else:
+                                # Regular single face photo
+                                st.image(display_img, caption=os.path.basename(original_img_path), width=200)
+                                
                         except Exception as e:
                             st.error(f"Error loading image: {e}")
                             continue
@@ -324,42 +387,14 @@ with tab3:
                         st.write(f"**Match #{match_idx+1}**")
                         # Convert distance to percentage (lower distance = better match)
                         match_percentage = max(0, min(100, (1 - match['distance']) * 100))
-                        st.write(f"Match: {match_percentage:.1f}%")
                         
-                        # Only show age and gender if available
-                        if match.get('analysis') and len(match['analysis']) > 0:
-                            analysis = match['analysis'][0]
-                            
-                            if 'age' in analysis:
-                                st.write(f"Age: {analysis['age']}")
-                            
-                            if 'gender' in analysis:
-                                gender_data = analysis['gender']
-                                
-                                # Handle when gender is returned as a dictionary with probabilities
-                                if isinstance(gender_data, dict):
-                                    # Find gender with highest probability
-                                    if 'Man' in gender_data and 'Woman' in gender_data:
-                                        is_male = gender_data['Man'] > gender_data['Woman']
-                                        gender = "Male" if is_male else "Female"
-                                        confidence = gender_data['Man'] if is_male else gender_data['Woman']
-                                        st.write(f"Gender: {gender} ({confidence:.1f}%)")
-                                    else:
-                                        # If the format is different, just show the raw data
-                                        st.write(f"Gender: {gender_data}")
-                                # Handle when gender is returned as a string
-                                elif isinstance(gender_data, str):
-                                    # Convert string gender to "Male" or "Female"
-                                    if gender_data.lower() in ["man", "male"]:
-                                        gender = "Male"
-                                    elif gender_data.lower() in ["woman", "female"]:
-                                        gender = "Female"
-                                    else:
-                                        gender = gender_data
-                                    st.write(f"Gender: {gender}")
-                                else:
-                                    # For any other format, just display as is
-                                    st.write(f"Gender: {gender_data}")
+                        # Use colors to indicate match quality
+                        if match_percentage >= 90:
+                            st.markdown(f"<h3 style='color:green'>Match: {match_percentage:.1f}%</h3>", unsafe_allow_html=True)
+                        elif match_percentage >= 75:
+                            st.markdown(f"<h3 style='color:orange'>Match: {match_percentage:.1f}%</h3>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<h3 style='color:red'>Match: {match_percentage:.1f}%</h3>", unsafe_allow_html=True)
     else:
         st.info("No matches found. Please run an identification in the Identification tab.")
 

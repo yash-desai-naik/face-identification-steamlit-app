@@ -15,6 +15,7 @@ from PIL import Image
 import tempfile
 import atexit
 import psutil
+import cv2
 from utils import (
     create_library_directory, 
     save_uploaded_image, 
@@ -23,13 +24,23 @@ from utils import (
     analyze_face, 
     find_matching_faces, 
     sort_matches,
-    deepface_available
+    deepface_available,
+    get_face_metadata,
+    extract_and_save_faces_metadata
 )
 
 # Check if DeepFace is installed
 if not deepface_available:
     st.error("DeepFace library is not installed. Please run: pip install deepface")
     st.stop()
+
+# Add OpenCV to requirements.txt
+try:
+    if "opencv-python-headless" not in open("requirements.txt").read():
+        with open("requirements.txt", "a") as f:
+            f.write("\nopencv-python-headless")
+except:
+    pass
 
 # Global variables
 LIBRARY_PATH = create_library_directory()
@@ -108,6 +119,7 @@ with st.sidebar:
     - Upload images to create a photo library
     - Identify faces using uploaded images or camera
     - Analyze basic face attributes (age and gender)
+    - Detect and match faces in group photos
     - Sort and filter matches
     - Parallel processing for improved performance
     """)
@@ -137,6 +149,15 @@ with tab1:
     if library_images:
         st.subheader(f"Library Images ({len(library_images)})")
         
+        # Display checkbox for face metadata analysis
+        analyze_all = st.checkbox("Analyze faces in all images", value=False)
+        if analyze_all:
+            with st.spinner("Analyzing faces in library images..."):
+                for img_path in library_images:
+                    metadata = get_face_metadata(img_path, LIBRARY_PATH)
+                    if metadata:
+                        st.write(f"Found {metadata['face_count']} face(s) in {os.path.basename(img_path)}")
+        
         # Create a grid layout for displaying images
         cols_per_row = 4
         rows = (len(library_images) + cols_per_row - 1) // cols_per_row
@@ -151,13 +172,36 @@ with tab1:
                     with cols[col_idx]:
                         img_path = library_images[img_idx]
                         img = Image.open(img_path)
-                        st.image(img, caption=os.path.basename(img_path), width=150)
+                        
+                        # Get face metadata
+                        metadata = get_face_metadata(img_path, LIBRARY_PATH)
+                        face_count = metadata.get('face_count', 0) if metadata else 0
+                        
+                        # Show badge for group photos
+                        if face_count > 1:
+                            st.image(img, caption=f"{os.path.basename(img_path)} ({face_count} faces)", width=150)
+                        else:
+                            st.image(img, caption=os.path.basename(img_path), width=150)
                         
                         # Add delete button for each image
                         if st.button(f"Delete", key=f"delete_{img_idx}"):
                             if delete_image(img_path):
                                 st.success(f"Deleted {os.path.basename(img_path)}")
                                 st.rerun()
+                                
+                        # Add analyze button for each image
+                        if st.button(f"Analyze Faces", key=f"analyze_{img_idx}"):
+                            with st.spinner(f"Analyzing faces in {os.path.basename(img_path)}..."):
+                                metadata = extract_and_save_faces_metadata(img_path, LIBRARY_PATH)
+                                if metadata:
+                                    st.write(f"Found {metadata['face_count']} face(s)")
+                                    # If it's a group photo, show extracted faces
+                                    if metadata.get('is_group_photo', False) and metadata.get('face_files'):
+                                        face_cols = st.columns(min(4, len(metadata['face_files'])))
+                                        for i, face_file in enumerate(metadata['face_files']):
+                                            with face_cols[i % 4]:
+                                                face_img = Image.open(face_file['path'])
+                                                st.image(face_img, caption=f"Face {i+1}", width=100)
     else:
         st.info("No images in the library. Please upload some images.")
 
@@ -228,7 +272,8 @@ with tab2:
                     threshold=st.session_state.threshold,
                     model_name=st.session_state.model_name,
                     progress_bar=progress_bar,
-                    max_workers=st.session_state.max_workers
+                    max_workers=st.session_state.max_workers,
+                    library_path=LIBRARY_PATH
                 )
                 
                 # Log memory usage after processing
@@ -265,7 +310,11 @@ with tab3:
     if 'matches' in st.session_state and st.session_state.matches:
         matches = st.session_state.matches
         
-        st.success(f"Found {len(matches)} matching faces!")
+        # Categorize matches into direct and group photo matches
+        direct_matches = [m for m in matches if not m.get('is_face_extract', False)]
+        group_matches = [m for m in matches if m.get('is_face_extract', False)]
+        
+        st.success(f"Found {len(matches)} matching faces! ({len(direct_matches)} direct matches, {len(group_matches)} from group photos)")
         
         # Simple sorting options
         sort_by = st.selectbox(
@@ -273,14 +322,24 @@ with tab3:
             ["Best Match (Highest %)", "Worst Match (Lowest %)", "Age", "Gender"]
         )
         
+        # Filter options
+        show_option = st.radio("Show matches from:", ["All Matches", "Direct Matches Only", "Group Photos Only"])
+        
+        # Filter matches based on selection
+        filtered_matches = matches
+        if show_option == "Direct Matches Only":
+            filtered_matches = direct_matches
+        elif show_option == "Group Photos Only":
+            filtered_matches = group_matches
+        
         # Sort the matches based on selected criteria
         if sort_by == "Best Match (Highest %)":
-            sorted_matches = sorted(matches, key=lambda x: x['distance'])  # Lower distance = better match
+            sorted_matches = sorted(filtered_matches, key=lambda x: x['distance'])  # Lower distance = better match
         elif sort_by == "Worst Match (Lowest %)":
-            sorted_matches = sorted(matches, key=lambda x: x['distance'], reverse=True)
+            sorted_matches = sorted(filtered_matches, key=lambda x: x['distance'], reverse=True)
         elif sort_by == "Age":
             # Sort by age (youngest to oldest)
-            sorted_matches = sorted(matches, key=lambda x: x['analysis'][0]['age'] if x.get('analysis') and len(x.get('analysis', [])) > 0 and 'age' in x['analysis'][0] else 999)
+            sorted_matches = sorted(filtered_matches, key=lambda x: x['analysis'][0]['age'] if x.get('analysis') and len(x.get('analysis', [])) > 0 and 'age' in x['analysis'][0] else 999)
         elif sort_by == "Gender":
             # Sort by gender (Female then Male)
             def get_gender(match):
@@ -295,7 +354,7 @@ with tab3:
                     else:
                         return "Male"
                 return str(gender_data)
-            sorted_matches = sorted(matches, key=get_gender)
+            sorted_matches = sorted(filtered_matches, key=get_gender)
         
         # Display matches in a grid layout
         cols_per_row = 3
@@ -312,8 +371,31 @@ with tab3:
                     
                     with cols[col_idx]:
                         try:
-                            img = Image.open(match['image_path'])
-                            st.image(img, caption=os.path.basename(match['image_path']), width=200)
+                            # Show original image with highlight if it's from a group photo
+                            original_img_path = match['image_path']
+                            display_img = Image.open(original_img_path)
+                            
+                            # If this is a face from a group photo, highlight the face
+                            if match.get('is_face_extract', False) and match.get('facial_area'):
+                                # Draw rectangle around matched face in original image
+                                img_cv = cv2.imread(original_img_path)
+                                facial_area = match['facial_area']
+                                x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
+                                cv2.rectangle(img_cv, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                                
+                                # Convert back to PIL for display
+                                display_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+                                
+                                # Show the caption with group photo designation
+                                st.image(display_img, caption=f"Group photo: {os.path.basename(original_img_path)}", width=200)
+                                
+                                # Also display the extracted face
+                                face_img = Image.open(match['face_path'])
+                                st.image(face_img, caption="Matched Face", width=100)
+                            else:
+                                # Regular single face photo
+                                st.image(display_img, caption=os.path.basename(original_img_path), width=200)
+                                
                         except Exception as e:
                             st.error(f"Error loading image: {e}")
                             continue

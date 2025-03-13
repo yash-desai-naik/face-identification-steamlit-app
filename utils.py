@@ -3,11 +3,6 @@ import numpy as np
 from PIL import Image
 import shutil
 import importlib.util
-import os
-
-# Force CPU only for TensorFlow operations
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import concurrent.futures
 import time
 import gc
